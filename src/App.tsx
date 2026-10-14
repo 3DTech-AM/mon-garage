@@ -27,11 +27,13 @@ function MainApp() {
   // Register service worker
   useEffect(() => {
     if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('/sw.js').catch(() => {
-        // ignore registration errors
+      navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`).catch((error) => {
+        console.error('Erreur enregistrement Service Worker :', error);
       });
     }
   }, []);
+
+
 
   // Handle notification click — navigate to vehicle
   useEffect(() => {
