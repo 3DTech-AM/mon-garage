@@ -64,11 +64,14 @@ Vous obtenez une **public key** et une **private key**.
   VITE_VAPID_PUBLIC_KEY=votre_cle_publique
   ```
 
-- Ajoutez les deux clés comme **secrets des Edge Functions** dans le dashboard Supabase :
+- Ajoutez les trois secrets suivants comme **secrets des Edge Functions** dans le dashboard Supabase (Edge Functions > Secrets) :
   - `VAPID_PUBLIC_KEY` = votre clé publique
   - `VAPID_PRIVATE_KEY` = votre clé privée
+  - `VAPID_SUBJECT` = votre adresse de contact (par exemple `mailto:votre@email.com`)
 
   **La clé privée ne doit JAMAIS apparaître dans le code frontend.**
+
+- Ajoutez également le secret `CRON_SECRET` : choisissez une chaîne aléatoire (par exemple 32 caractères). Ce secret protège l'Edge Function `check-reminders` contre les appels non autorisés.
 
 ### 3. Base de données
 
@@ -82,27 +85,29 @@ Le schéma SQL a déjà été appliqué au projet Supabase. Il crée 5 tables :
 
 Toutes les tables ont RLS activé avec des politiques d'ownership (`auth.uid() = user_id`).
 
-### 4. Configuration du Cron Supabase
+### 4. Configuration du Cron quotidien
 
-Pour que les vérifications quotidiennes des échéances soient automatiques, configurez un Cron job Supabase qui appelle l'Edge Function `check-reminders` chaque jour.
+La vérification quotidienne des échéances est déclenchée par **GitHub Actions** (fichier `.github/workflows/check-reminders.yml`). Le workflow s'exécute chaque jour à 07:00 UTC (08:00 ou 09:00 Europe/Zurich selon la saison) et appelle l'Edge Function `check-reminders` avec le secret `CRON_SECRET`.
 
-Dans le dashboard Supabase : **Database > Extensions**, activez `pg_cron` si ce n'est pas déjà fait. Puis dans **SQL Editor**, exécutez :
+Vous pouvez aussi déclencher la vérification manuellement depuis l'onglet **Actions** de votre dépôt GitHub.
+
+Alternativement, vous pouvez utiliser Supabase Cron à la place de GitHub Actions. Dans le dashboard Supabase : **Database > Extensions**, activez `pg_cron` si nécessaire. Puis dans **SQL Editor** :
 
 ```sql
 SELECT cron.schedule(
   'mon-garage-check-reminders',
-  '0 7 * * *',  -- Tous les jours à 07:00 UTC (09:00 Europe/Zurich en été)
-  $$
+  '0 7 * * *',
+  $
   SELECT net.http_post(
     url := 'https://VOTRE_PROJET.supabase.co/functions/v1/check-reminders',
-    headers := '{"Content-Type": "application/json"}'::jsonb,
+    headers := '{"Content-Type": "application/json", "X-Cron-Secret": "VOTRE_CRON_SECRET"}'::jsonb,
     body := '{}'::jsonb
   );
-  $$
+  $
 );
 ```
 
-Remplacez `VOTRE_PROJET` par votre identifiant de projet Supabase.
+Remplacez `VOTRE_PROJET` et `VOTRE_CRON_SECRET` par vos valeurs.
 
 ### 5. Edge Functions
 
@@ -125,6 +130,7 @@ Dans **Settings > Secrets and variables > Actions** de votre dépôt, ajoutez :
 - `VITE_SUPABASE_URL` — l'URL Supabase
 - `VITE_SUPABASE_ANON_KEY` — la clé anon Supabase
 - `VITE_VAPID_PUBLIC_KEY` — la clé publique VAPID
+- `CRON_SECRET` — le secret utilisé pour authentifier le cron `check-reminders`
 
 Si votre site est hébergé sur `https://nomutilisateur.github.io/nom-depot/` (projet), ajoutez aussi une variable (pas un secret) :
 
@@ -169,6 +175,22 @@ Le service worker (`public/sw.js`) et le manifeste (`public/manifest.json`) util
 - Les opérations d'écriture sont désactivées hors ligne (bannière d'avertissement affichée).
 - Aucune modification n'est perdue silencieusement.
 
+## Tests des notifications push
+
+Les tests à effectuer sont décrits dans `tests/notifications.md`. Ils couvrent :
+
+- Abonnement sur iPhone et Android
+- Notification de test (app ouverte et fermée)
+- Rappel automatique via cron
+- Prévention des doublons
+- Notifications en retard persistantes
+- Nettoyage des abonnements expirés
+- Fuseau horaire Europe/Zurich
+- Changement d'heure
+- Sécurité (refus sans CRON_SECRET, sans authentification, envoi arbitraire bloqué)
+
+**Aucun test réel n'a encore été effectué.** Les notifications ne doivent pas être considérées comme fonctionnelles tant que les tests décrits n'ont pas été validés sur des appareils physiques.
+
 ## Limitations
 
 - La réception des notifications n'est pas garantie si le service backend Supabase est suspendu (projet gratuit en pause).
@@ -198,7 +220,9 @@ supabase/
 │   └── check-reminders/
 └── migrations/      # Schéma SQL
 .github/
-└── workflows/       # GitHub Actions
+└── workflows/       # GitHub Actions (déploiement + cron quotidien)
+tests/
+└── notifications.md # Tests des notifications push
 ```
 
 ## Scripts

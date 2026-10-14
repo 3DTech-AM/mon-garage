@@ -1,0 +1,26 @@
+name: Check reminders (cron)
+
+on:
+  schedule:
+    # 07:00 UTC = 09:00 Europe/Zurich (summer) / 08:00 (winter)
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+
+jobs:
+  check-reminders:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger check-reminders Edge Function
+        run: |
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            "${{ secrets.VITE_SUPABASE_URL }}/functions/v1/check-reminders" \
+            -H "Content-Type: application/json" \
+            -H "X-Cron-Secret: ${{ secrets.CRON_SECRET }}" \
+            -d '{"secret":"${{ secrets.CRON_SECRET }}"}')
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          echo "HTTP $HTTP_CODE"
+          echo "$BODY"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::warning::check-reminders returned HTTP $HTTP_CODE"
+          fi

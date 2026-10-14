@@ -106,11 +106,7 @@ export async function sendTestNotification(): Promise<{ success: boolean; messag
       'Content-Type': 'application/json',
       Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
     },
-    body: JSON.stringify({
-      type: 'test',
-      title: 'Mon Garage — Test',
-      body: 'Notification de test envoyée avec succès.',
-    }),
+    body: JSON.stringify({}),
   });
 
   if (!response.ok) {

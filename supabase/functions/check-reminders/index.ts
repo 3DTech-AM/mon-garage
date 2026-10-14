@@ -1,4 +1,5 @@
 import { createClient } from 'npm:@supabase/supabase-js@2.57.4';
+import webpush from 'npm:web-push@3.6.7';
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -27,19 +28,42 @@ interface ReminderWithVehicle {
   vehicles: { brand: string; model: string; mileage: number } | null;
 }
 
+type ReminderStatus = 'a_jour' | 'prochainement' | 'a_effectuer' | 'en_retard';
+
+/**
+ * Compute "today at midnight" in Europe/Zurich.
+ * The cron runs in UTC, so we need to convert to local time for date comparisons.
+ */
+function getZurichToday(): Date {
+  const now = new Date();
+  // Format to Europe/Zurich using Intl, then extract the date parts
+  const formatter = new Intl.DateTimeFormat('sv-SE', {
+    timeZone: 'Europe/Zurich',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  const parts = formatter.formatToParts(now);
+  const year = parts.find(p => p.type === 'year')?.value || '2026';
+  const month = parts.find(p => p.type === 'month')?.value || '01';
+  const day = parts.find(p => p.type === 'day')?.value || '01';
+  return new Date(`${year}-${month}-${day}T00:00:00`);
+}
+
 function getReminderStatus(
   reminder: Pick<ReminderWithVehicle, 'target_date' | 'target_mileage' | 'alert_days_threshold' | 'alert_km_threshold' | 'completed' | 'active'>,
   currentMileage: number
-): 'a_jour' | 'prochainement' | 'a_effectuer' | 'en_retard' {
+): ReminderStatus {
   if (reminder.completed || !reminder.active) return 'a_jour';
 
-  const now = new Date();
-  let dateStatus: 'a_jour' | 'prochainement' | 'a_effectuer' | 'en_retard' | null = null;
-  let kmStatus: 'a_jour' | 'prochainement' | 'a_effectuer' | 'en_retard' | null = null;
+  const today = getZurichToday();
+  let dateStatus: ReminderStatus | null = null;
+  let kmStatus: ReminderStatus | null = null;
 
   if (reminder.target_date) {
     const targetDate = new Date(reminder.target_date + 'T00:00:00');
-    const diffDays = Math.ceil((targetDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+    const diffMs = targetDate.getTime() - today.getTime();
+    const diffDays = Math.round(diffMs / (1000 * 60 * 60 * 24));
     if (diffDays < 0) dateStatus = 'en_retard';
     else if (diffDays <= reminder.alert_days_threshold) dateStatus = 'a_effectuer';
     else if (diffDays <= reminder.alert_days_threshold + 30) dateStatus = 'prochainement';
@@ -55,7 +79,7 @@ function getReminderStatus(
   }
 
   if (dateStatus && kmStatus) {
-    const priority = { en_retard: 3, a_effectuer: 2, prochainement: 1, a_jour: 0 };
+    const priority: Record<ReminderStatus, number> = { en_retard: 3, a_effectuer: 2, prochainement: 1, a_jour: 0 };
     return priority[dateStatus] >= priority[kmStatus] ? dateStatus : kmStatus;
   }
   return dateStatus || kmStatus || 'a_jour';
@@ -67,9 +91,37 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    // Get VAPID keys
+    // Verify CRON_SECRET to prevent unauthorized calls
+    const cronSecret = Deno.env.get("CRON_SECRET");
+    if (!cronSecret) {
+      return new Response(JSON.stringify({ error: "CRON_SECRET non configuré" }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    // Accept secret via header or body
+    const headerSecret = req.headers.get("X-Cron-Secret") || "";
+    let bodySecret = "";
+
+    try {
+      const bodyData = await req.json();
+      bodySecret = bodyData?.secret || "";
+    } catch {
+      // Body may be empty for GET requests
+    }
+
+    if (headerSecret !== cronSecret && bodySecret !== cronSecret) {
+      return new Response(JSON.stringify({ error: "Non autorisé" }), {
+        status: 403,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    // Configure web-push
     const vapidPublicKey = Deno.env.get("VAPID_PUBLIC_KEY");
     const vapidPrivateKey = Deno.env.get("VAPID_PRIVATE_KEY");
+    const vapidSubject = Deno.env.get("VAPID_SUBJECT") || "mailto:contact@mon-garage.app";
 
     if (!vapidPublicKey || !vapidPrivateKey) {
       return new Response(JSON.stringify({ error: "VAPID keys not configured" }), {
@@ -77,6 +129,8 @@ Deno.serve(async (req: Request) => {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
+
+    webpush.setVapidDetails(vapidSubject, vapidPublicKey, vapidPrivateKey);
 
     // Get all active, non-completed reminders with vehicle info
     const { data: reminders, error: rError } = await supabase
@@ -97,14 +151,14 @@ Deno.serve(async (req: Request) => {
     }
 
     if (!reminders || reminders.length === 0) {
-      return new Response(JSON.stringify({ message: "No active reminders", sent: 0 }), {
+      return new Response(JSON.stringify({ message: "Aucun rappel actif", sent: 0, skipped: 0 }), {
         status: 200,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
-    // Group reminders by user and determine which need notifications
-    const userReminders = new Map<string, { reminder: ReminderWithVehicle; status: string }[]>();
+    // Group reminders by user, keeping only those that need notifications
+    const userReminders = new Map<string, { reminder: ReminderWithVehicle; status: ReminderStatus }[]>();
 
     for (const reminder of reminders) {
       const vehicle = reminder.vehicles;
@@ -112,7 +166,6 @@ Deno.serve(async (req: Request) => {
 
       const status = getReminderStatus(reminder, vehicle.mileage);
 
-      // Only send notifications for a_effectuer and en_retard
       if (status !== 'a_effectuer' && status !== 'en_retard') continue;
 
       if (!userReminders.has(reminder.user_id)) {
@@ -123,9 +176,9 @@ Deno.serve(async (req: Request) => {
 
     let totalSent = 0;
     let totalSkipped = 0;
+    let totalFailed = 0;
 
     for (const [userId, items] of userReminders) {
-      // Get push subscriptions for this user
       const { data: subscriptions } = await supabase
         .from("push_subscriptions")
         .select("*")
@@ -136,16 +189,19 @@ Deno.serve(async (req: Request) => {
       for (const { reminder, status } of items) {
         const vehicle = reminder.vehicles!;
 
-        // Check for duplicate notifications — look at log for this reminder in the last 24h
-        // For en_retard, only send once every 7 days to avoid spam
-        const lookbackHours = status === 'en_retard' ? 168 : 24; // 7 days for overdue, 24h for due
+        // Duplicate prevention: check if a SUCCESSFUL notification was already
+        // logged for this reminder within the lookback window.
+        // en_retard: 7 days (168h) to avoid excessive daily spam
+        // a_effectuer: 24h (once per day is enough)
+        const lookbackHours = status === 'en_retard' ? 168 : 24;
         const since = new Date(Date.now() - lookbackHours * 60 * 60 * 1000).toISOString();
 
         const { data: existingLog } = await supabase
           .from("notification_log")
-          .select("id")
+          .select("id, status")
           .eq("user_id", userId)
           .eq("reminder_id", reminder.id)
+          .eq("status", "sent")
           .gte("sent_at", since)
           .limit(1);
 
@@ -155,67 +211,85 @@ Deno.serve(async (req: Request) => {
         }
 
         // Build notification message
-        let body: string;
+        let messageBody: string;
         if (status === 'en_retard') {
           if (reminder.target_date && reminder.target_mileage != null) {
-            body = `${vehicle.brand} ${vehicle.model}: ${reminder.type} en retard (échéance: ${reminder.target_date}, ${reminder.target_mileage} km)`;
+            messageBody = `${vehicle.brand} ${vehicle.model}: ${reminder.type} en retard (échéance: ${reminder.target_date}, ${reminder.target_mileage} km)`;
           } else if (reminder.target_date) {
-            body = `${vehicle.brand} ${vehicle.model}: ${reminder.type} en retard (échéance: ${reminder.target_date})`;
+            messageBody = `${vehicle.brand} ${vehicle.model}: ${reminder.type} en retard (échéance: ${reminder.target_date})`;
           } else {
-            body = `${vehicle.brand} ${vehicle.model}: ${reminder.type} en retard (${reminder.target_mileage} km)`;
+            messageBody = `${vehicle.brand} ${vehicle.model}: ${reminder.type} en retard (${reminder.target_mileage} km)`;
           }
         } else {
           if (reminder.target_date && reminder.target_mileage != null) {
-            body = `${vehicle.brand} ${vehicle.model}: ${reminder.type} à effectuer bientôt (${reminder.target_date}, ${reminder.target_mileage} km)`;
+            messageBody = `${vehicle.brand} ${vehicle.model}: ${reminder.type} à effectuer bientôt (${reminder.target_date}, ${reminder.target_mileage} km)`;
           } else if (reminder.target_date) {
-            body = `${vehicle.brand} ${vehicle.model}: ${reminder.type} à effectuer bientôt (${reminder.target_date})`;
+            messageBody = `${vehicle.brand} ${vehicle.model}: ${reminder.type} à effectuer bientôt (${reminder.target_date})`;
           } else {
-            body = `${vehicle.brand} ${vehicle.model}: ${reminder.type} à effectuer (${reminder.target_mileage} km)`;
+            messageBody = `${vehicle.brand} ${vehicle.model}: ${reminder.type} à effectuer (${reminder.target_mileage} km)`;
           }
         }
+
+        const pushPayload = JSON.stringify({
+          title: "Mon Garage — Rappel d'entretien",
+          body: messageBody,
+          vehicleId: reminder.vehicle_id,
+          tag: `reminder-${reminder.id}`,
+        });
 
         // Send to all subscriptions for this user
         let anySuccess = false;
+        let lastError: string | null = null;
         const expiredEndpoints: string[] = [];
 
         for (const sub of subscriptions) {
-          const result = await sendPushNotification(sub, {
-            title: "Mon Garage — Rappel d'entretien",
-            body,
-            vehicleId: reminder.vehicle_id,
-            tag: `reminder-${reminder.id}`,
-          }, vapidPublicKey, vapidPrivateKey);
+          const pushSubscription = {
+            endpoint: sub.endpoint,
+            keys: { p256dh: sub.p256dh_key, auth: sub.auth_key },
+          };
 
-          if (result.success) {
+          try {
+            await webpush.sendNotification(pushSubscription, pushPayload, { TTL: 86400 });
             anySuccess = true;
-          } else if (result.error === "subscription_expired") {
-            expiredEndpoints.push(sub.endpoint);
+          } catch (err) {
+            lastError = err.message || String(err);
+            const statusCode = err.statusCode || 0;
+            if (statusCode === 404 || statusCode === 410) {
+              expiredEndpoints.push(sub.endpoint);
+            }
           }
         }
 
-        // Clean up expired
+        // Clean up expired subscriptions
         if (expiredEndpoints.length > 0) {
           await supabase.from("push_subscriptions").delete().in("endpoint", expiredEndpoints);
         }
 
-        // Log the notification
+        // Log the notification result — only "sent" if at least one push succeeded
         await supabase.from("notification_log").insert({
           user_id: userId,
           reminder_id: reminder.id,
           vehicle_id: reminder.vehicle_id,
-          message: body,
+          message: messageBody,
           status: anySuccess ? "sent" : "failed",
+          error_message: anySuccess ? null : lastError,
         });
 
-        if (anySuccess) totalSent++;
+        if (anySuccess) {
+          totalSent++;
+        } else {
+          totalFailed++;
+        }
       }
     }
 
     return new Response(JSON.stringify({
-      message: "Check complete",
+      message: "Vérification terminée",
       sent: totalSent,
       skipped: totalSkipped,
+      failed: totalFailed,
       totalReminders: reminders.length,
+      zurichDate: getZurichToday().toISOString().slice(0, 10),
     }), {
       status: 200,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -227,172 +301,3 @@ Deno.serve(async (req: Request) => {
     });
   }
 });
-
-// Inline push sending (same as send-notification function)
-async function sendPushNotification(
-  subscription: { endpoint: string; p256dh_key: string; auth_key: string },
-  payload: { title: string; body: string; vehicleId?: string; tag?: string },
-  vapidPublicKey: string,
-  vapidPrivateKey: string
-): Promise<{ success: boolean; error?: string }> {
-  try {
-    const message = JSON.stringify(payload);
-    const encodedMessage = new TextEncoder().encode(message);
-
-    const localKeyPair = await crypto.subtle.generateKey(
-      { name: "ECDH", namedCurve: "P-256" },
-      true,
-      ["deriveKey", "deriveBits"]
-    );
-
-    const localPublicKey = new Uint8Array(await crypto.subtle.exportKey("raw", localKeyPair.publicKey));
-    const subscriptionPublicKey = base64UrlToUint8Array(subscription.p256dh_key);
-    const subscriptionAuthKey = base64UrlToUint8Array(subscription.auth_key);
-
-    const subscriberEcdhKey = await crypto.subtle.importKey(
-      "raw", subscriptionPublicKey,
-      { name: "ECDH", namedCurve: "P-256" }, false, []
-    );
-
-    const sharedSecret = new Uint8Array(await crypto.subtle.deriveBits(
-      { name: "ECDH", public: subscriberEcdhKey },
-      localKeyPair.privateKey, 256
-    ));
-
-    const ikm = sharedSecret;
-    const info = new Uint8Array([
-      ...new TextEncoder().encode("WebPush: info\0"),
-      ...subscriptionPublicKey,
-      ...localPublicKey,
-    ]);
-    const cekInfo = new TextEncoder().encode("Content-Encoding: aes128gcm\0");
-    const nonceInfo = new TextEncoder().encode("Content-Encoding: nonce\0");
-
-    const prkKey = await hkdfExtract(ikm, subscriptionAuthKey);
-    const cek = await hkdfExpand(prkKey, cekInfo, 16);
-    const nonce = await hkdfExpand(prkKey, nonceInfo, 12);
-
-    const cryptoKey = await crypto.subtle.importKey("raw", cek, { name: "AES-GCM" }, false, ["encrypt"]);
-    const encrypted = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, cryptoKey, encodedMessage));
-
-    const header = buildAes128GcmHeader(localPublicKey, encrypted.length + 16);
-    const body = new Uint8Array(header.length + encrypted.length);
-    body.set(header, 0);
-    body.set(encrypted, header.length);
-
-    const jwt = await buildVapidJwt(vapidPublicKey, vapidPrivateKey, new URL(subscription.endpoint).origin);
-
-    const response = await fetch(subscription.endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/octet-stream",
-        "Content-Encoding": "aes128gcm",
-        "TTL": "86400",
-        "Authorization": `vapid t=${jwt}, k=${vapidPublicKey}`,
-      },
-      body,
-    });
-
-    if (!response.ok) {
-      if (response.status === 404 || response.status === 410) {
-        return { success: false, error: "subscription_expired" };
-      }
-      return { success: false, error: `push_failed_${response.status}` };
-    }
-    return { success: true };
-  } catch (err) {
-    return { success: false, error: err.message };
-  }
-}
-
-function base64UrlToUint8Array(base64Url: string): Uint8Array {
-  const base64 = base64Url.replace(/-/g, "+").replace(/_/g, "/");
-  const padding = "=".repeat((4 - (base64.length % 4)) % 4);
-  const binary = atob(base64 + padding);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-}
-
-async function hkdfExtract(ikm: Uint8Array, salt: Uint8Array): Promise<ArrayBuffer> {
-  const key = await crypto.subtle.importKey("raw", ikm, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  return crypto.subtle.sign("HMAC", key, salt);
-}
-
-async function hkdfExpand(prk: ArrayBuffer, info: Uint8Array, length: number): Promise<Uint8Array> {
-  const key = await crypto.subtle.importKey("raw", prk, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const blocks: Uint8Array[] = [];
-  let prev = new Uint8Array(0);
-  let remaining = length;
-
-  for (let counter = 1; remaining > 0; counter++) {
-    const input = new Uint8Array(prev.length + info.length + 1);
-    input.set(prev, 0);
-    input.set(info, prev.length);
-    input[prev.length + info.length] = counter;
-    const sig = new Uint8Array(await crypto.subtle.sign("HMAC", key, input));
-    const take = Math.min(sig.length, remaining);
-    blocks.push(sig.slice(0, take));
-    prev = sig;
-    remaining -= take;
-  }
-
-  const result = new Uint8Array(length);
-  let offset = 0;
-  for (const block of blocks) { result.set(block, offset); offset += block.length; }
-  return result;
-}
-
-function buildAes128GcmHeader(localPublicKey: Uint8Array, contentLength: number): Uint8Array {
-  const salt = new Uint8Array(16);
-  const header = new Uint8Array(21 + localPublicKey.length);
-  header.set(salt, 0);
-  const dv = new DataView(header.buffer, 16, 5);
-  dv.setUint32(0, contentLength, false);
-  dv.setUint8(4, localPublicKey.length);
-  header.set(localPublicKey, 21);
-  return header;
-}
-
-async function buildVapidJwt(publicKey: string, privateKey: string, origin: string): Promise<string> {
-  const header = { typ: "JWT", alg: "ES256" };
-  const now = Math.floor(Date.now() / 1000);
-  const payload = { aud: origin, exp: now + 12 * 60 * 60, sub: "mailto:mon-garage@example.com" };
-  const encodedHeader = btoa(JSON.stringify(header)).replace(/=/g, "");
-  const encodedPayload = btoa(JSON.stringify(payload)).replace(/=/g, "");
-  const unsigned = `${encodedHeader}.${encodedPayload}`;
-
-  const privateKeyBuffer = base64UrlToUint8Array(privateKey);
-  const pkcs8 = new Uint8Array(138);
-  const pkcs8Header = new Uint8Array([
-    0x30, 0x81, 0x87, 0x02, 0x01, 0x00, 0x30, 0x13,
-    0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02,
-    0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d,
-    0x03, 0x01, 0x07, 0x04, 0x6d, 0x30, 0x6b, 0x02,
-    0x01, 0x01, 0x04, 0x40
-  ]);
-  pkcs8.set(pkcs8Header, 0);
-  pkcs8.set(privateKeyBuffer.slice(0, 32), pkcs8Header.length);
-  pkcs8[pkcs8Header.length + 32] = 0x04;
-  const publicKeyBuffer = base64UrlToUint8Array(publicKey);
-  pkcs8.set(publicKeyBuffer.slice(1, 65), pkcs8Header.length + 33);
-
-  const key = await crypto.subtle.importKey("pkcs8", pkcs8, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
-  const signature = new Uint8Array(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key, new TextEncoder().encode(unsigned)));
-  const rawSig = derToRaw(signature);
-  const encodedSig = btoa(String.fromCharCode(...rawSig)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
-  return `${unsigned}.${encodedSig}`;
-}
-
-function derToRaw(signature: Uint8Array): Uint8Array {
-  const rStart = 4;
-  const rLength = signature[rStart - 1];
-  const r = signature.slice(rStart, rStart + rLength);
-  const sStart = rStart + rLength + 2;
-  const sLength = signature[sStart - 1];
-  const s = signature.slice(sStart, sStart + sLength);
-  const raw = new Uint8Array(64);
-  raw.set(r.slice(-32), 32 - Math.min(r.length, 32));
-  raw.set(s.slice(-32), 64 - Math.min(s.length, 32));
-  return raw;
-}
