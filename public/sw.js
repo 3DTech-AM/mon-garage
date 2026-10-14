@@ -1,76 +1,104 @@
-const CACHE_NAME = 'mon-garage-v1';
+
+const CACHE_NAME = 'mon-garage-v2';
+
+// Base URL derived from the service worker location
+const BASE_URL = new URL('./', self.location.href);
+
+const assetUrl = (path = '') =>
+  new URL(path, BASE_URL).href;
+
 const STATIC_ASSETS = [
-  '/',
-  '/index.html',
-  '/manifest.json',
-  '/icons/icon-192.png',
-  '/icons/icon-512.png',
+  assetUrl(),
+  assetUrl('manifest.json'),
+  assetUrl('icons/icon-192.png'),
+  assetUrl('icons/icon-512.png'),
 ];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => {
-      return cache.addAll(STATIC_ASSETS).catch(() => {
-        // If some assets fail to cache (e.g. icons not yet present), continue
-      });
+    caches.open(CACHE_NAME).then(async (cache) => {
+      for (const url of STATIC_ASSETS) {
+        try {
+          await cache.add(url);
+        } catch (error) {
+          console.warn('Cache asset unavailable:', url);
+        }
+      }
     })
   );
+
   self.skipWaiting();
 });
 
 self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches.keys().then((names) => {
-      return Promise.all(
-        names.filter((name) => name !== CACHE_NAME).map((name) => caches.delete(name))
+    (async () => {
+      const names = await caches.keys();
+
+      await Promise.all(
+        names
+          .filter((name) =>
+            name.startsWith('mon-garage-') &&
+            name !== CACHE_NAME
+          )
+          .map((name) => caches.delete(name))
       );
-    })
+
+      await self.clients.claim();
+    })()
   );
-  self.clients.claim();
 });
 
 self.addEventListener('fetch', (event) => {
-  // Only handle GET requests
   if (event.request.method !== 'GET') return;
 
   const url = new URL(event.request.url);
 
-  // Skip Supabase API calls — always go to network
-  if (url.hostname.includes('supabase.co')) return;
-
-  // Skip cross-origin requests
   if (url.origin !== self.location.origin) return;
+  if (!url.href.startsWith(BASE_URL.href)) return;
 
-  // Network-first for navigation, cache-first for static assets
   if (event.request.mode === 'navigate') {
     event.respondWith(
       fetch(event.request)
-        .then((response) => {
-          const clone = response.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
+        .then(async (response) => {
+          if (response.ok) {
+            const cache = await caches.open(CACHE_NAME);
+            await cache.put(event.request, response.clone());
+          }
           return response;
         })
-        .catch(() => caches.match(event.request).then((r) => r || caches.match('/')))
+        .catch(async () => {
+          return (
+            await caches.match(event.request) ||
+            await caches.match(assetUrl()) ||
+            Response.error()
+          );
+        })
     );
-  } else {
-    event.respondWith(
-      caches.match(event.request).then((cached) => {
-        return (
-          cached ||
-          fetch(event.request).then((response) => {
-            const clone = response.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
-            return response;
-          }).catch(() => cached)
-        );
-      })
-    );
+    return;
   }
+
+  event.respondWith(
+    caches.match(event.request).then(async (cached) => {
+      if (cached) return cached;
+
+      const response = await fetch(event.request);
+
+      if (response.ok && response.type === 'basic') {
+        const cache = await caches.open(CACHE_NAME);
+        await cache.put(event.request, response.clone());
+      }
+
+      return response;
+    })
+  );
 });
 
-// Handle push events
 self.addEventListener('push', (event) => {
-  let data = { title: 'Mon Garage', body: 'Nouvelle notification' };
+  let data = {
+    title: 'Mon Garage',
+    body: 'Nouvelle notification',
+  };
 
   try {
     if (event.data) {
@@ -84,48 +112,54 @@ self.addEventListener('push', (event) => {
 
   const options = {
     body: data.body,
-    icon: '/icons/icon-192.png',
-    badge: '/icons/icon-192.png',
-    vibrate: [200, 100, 200],
+    icon: assetUrl('icons/icon-192.png'),
+    badge: assetUrl('icons/icon-192.png'),
     tag: data.tag || 'mon-garage-notification',
     data: {
       vehicleId: data.vehicleId,
-      url: data.url || '/',
+      url: assetUrl(),
     },
   };
 
-  event.waitUntil(self.registration.showNotification(data.title, options));
+  event.waitUntil(
+    self.registration.showNotification(
+      data.title || 'Mon Garage',
+      options
+    )
+  );
 });
 
-// Handle notification click
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
 
   const vehicleId = event.notification.data?.vehicleId;
-  const targetUrl = event.notification.data?.url || '/';
+  const targetUrl = assetUrl();
 
   event.waitUntil(
-    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clientList) => {
-      // Focus existing window if open
-      for (const client of clientList) {
-        if ('focus' in client) {
-          client.postMessage({ type: 'NOTIFICATION_CLICK', vehicleId });
-          return client.focus();
+    (async () => {
+      const clients = await self.clients.matchAll({
+        type: 'window',
+        includeUncontrolled: true,
+      });
+
+      for (const client of clients) {
+        if (client.url.startsWith(BASE_URL.href)) {
+          await client.focus();
+          client.postMessage({
+            type: 'NOTIFICATION_CLICK',
+            vehicleId,
+          });
+          return;
         }
       }
-      // Open new window
+
       if (self.clients.openWindow) {
-        return self.clients.openWindow(targetUrl);
+        await self.clients.openWindow(targetUrl);
       }
-    })
+    })()
   );
 });
 
-// Handle push subscription change
 self.addEventListener('pushsubscriptionchange', (event) => {
-  event.waitUntil(
-    Promise.resolve().then(() => {
-      // The app will resubscribe on next open
-    })
-  );
+  // Re-subscription is handled when the app is reopened.
 });
